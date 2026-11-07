@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -739,6 +740,32 @@ bool PreloadAllPipelines() {
     }();
     return all;
 }
+
+// Adds the pipelines of an older version's used-pipeline list to this version's (a pipeline in both
+// keeps its more recent use), so the pipelines an older build used are built at boot too.
+void MergeUsedPipelines(const std::filesystem::path& destination,
+                        const std::filesystem::path& source) {
+    constexpr u8 KeepAllAges = 255;
+    const auto older = LoadUsedPipelines(source, KeepAllAges);
+    if (older.empty()) {
+        return;
+    }
+    auto merged = LoadUsedPipelines(destination, KeepAllAges);
+    for (const auto& [hash, age] : older) {
+        auto [it, inserted] = merged.try_emplace(hash, age);
+        if (!inserted && age < it->second) {
+            it->second = age;
+        }
+    }
+    std::ofstream file{destination, std::ios::binary | std::ios::trunc};
+    const u32 count = static_cast<u32>(merged.size());
+    file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
+    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    for (const auto& entry : merged) {
+        file.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
+        file.write(reinterpret_cast<const char*>(&entry.second), sizeof(entry.second));
+    }
+}
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
@@ -957,6 +984,28 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     std::filesystem::copy_file(VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", 52),
                                used_pipelines_filename, std::filesystem::copy_options::none,
                                migration_error);
+    // Cache version 53 holds the same records as this version: #432 moved to 54 for the SPIR-V of
+    // its NaN-defined min/max, and every record is translated again when it loads. A cache of this
+    // version started before this import lacks the places a version 53 build had been, so the
+    // version 53 records are copied once beside it (vulkan_import, loaded after it) and its
+    // used-pipeline list is merged into this one, so those pipelines are built at boot again. The
+    // version 53 files stay as they are for the builds that still read them.
+    const auto import_filename =
+        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_import", CACHE_VERSION);
+    auto import_done_filename = import_filename;
+    import_done_filename += ".done";
+    std::error_code import_error;
+    if (!std::filesystem::exists(import_done_filename, import_error) &&
+        VideoCommon::CopyCompatiblePipelineCache(
+            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", 53), import_filename,
+            shader_magic, 53, CACHE_VERSION)) {
+        std::ofstream import_done{import_done_filename};
+        import_done.close();
+        MergeUsedPipelines(used_pipelines_filename,
+                           VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", 53));
+        LOG_INFO(Render_Vulkan, "Imported the cache version 53 pipelines to {}",
+                 Common::FS::PathToUTF8String(import_filename));
+    }
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
@@ -1112,6 +1161,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         ++state.total;
     }};
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
+                               load_graphics);
+    // The imported cache version 53 records (see above). A record both files hold is built once.
+    VideoCommon::LoadPipelines(stop_loading, import_filename, CACHE_VERSION, load_compute,
                                load_graphics);
     for (auto& [key, candidates] : compute_envs) {
         OrderComputeTranslations(candidates);
@@ -1289,12 +1341,42 @@ void PipelineCache::EvictUnusedPipelines() {
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
+    // this long may be destroyed, but each one is translated again on the GPU thread when its place
+    // is revisited: Ocarina of Time evicted 6,182 in a 37 min session while ~1,000-2,400 stayed,
+    // and draws waited 230 s in all for pipelines being built. So pipelines are only evicted while
+    // more than 8,000 are cached (~3.6 GB of driver memory), and then the longest unused first,
+    // down to 7/8 of that. EDEN_NX2_PIPELINE_EVICT_ABOVE sets the limit (0 evicts as before).
     constexpr u64 EvictAfterFrames = 9000;
     if (frame_count <= EvictAfterFrames) {
         return;
     }
+    static const size_t evict_above = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+                                : size_t{8000};
+    }();
+    if (graphics_cache.size() <= evict_above) {
+        return;
+    }
     const u64 cutoff = frame_count - EvictAfterFrames;
+    // The last use at or before which pipelines are evicted: the oldest used ones until the cache
+    // is back to 7/8 of the limit, or every one unused since the cutoff if that is fewer. Prebuilt
+    // pipelines no draw has used yet are left to their budget below.
+    std::vector<u64> last_uses;
+    for (const auto& entry : graphics_cache) {
+        const GraphicsPipeline* const candidate = entry.second.get();
+        if (candidate != nullptr && candidate != current_pipeline && candidate->IsBuilt() &&
+            candidate->WasUsed() && candidate->LastUse() < cutoff) {
+            last_uses.push_back(candidate->LastUse());
+        }
+    }
+    const size_t excess = graphics_cache.size() - (evict_above - evict_above / 8);
+    u64 evict_through = cutoff - 1;
+    if (excess < last_uses.size()) {
+        const auto nth = last_uses.begin() + static_cast<std::ptrdiff_t>(excess - 1);
+        std::nth_element(last_uses.begin(), nth, last_uses.end());
+        evict_through = last_uses[excess - 1];
+    }
     const u64 tick = scheduler.CurrentTick();
     // ~0.9 GB of driver memory at ~0.45 MB each.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
@@ -1303,7 +1385,7 @@ void PipelineCache::EvictUnusedPipelines() {
     for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
         GraphicsPipeline* const pipeline = it->second.get();
         if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
-            pipeline->LastUse() >= cutoff) {
+            pipeline->LastUse() >= cutoff || pipeline->LastUse() > evict_through) {
             ++it;
             continue;
         }
